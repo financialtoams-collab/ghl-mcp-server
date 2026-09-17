@@ -107,6 +107,64 @@ open opportunities in toams" rather than an id nobody remembers. What that buys:
 
 `GHL_LOCATION_ID` with a single `GHL_API_KEY` still works unchanged.
 
+## Agency OAuth: one app, every sub-account
+
+Per-sub-account PITs stop scaling somewhere around a dozen, because each one is
+created by hand inside its own sub-account. For an agency with many sub-accounts — or
+one that keeps gaining them — install a single marketplace app on the agency instead:
+
+```bash
+GHL_CLIENT_ID=...
+GHL_CLIENT_SECRET=...
+GHL_APP_ID=...                              # from the marketplace listing
+GHL_TOKEN_STORE=/var/data/ghl-tokens.json   # must survive restarts, see below
+GHL_REDIRECT_URI=https://your-service.onrender.com/oauth/callback
+```
+
+Then open the app's install link once. The callback stores the agency refresh token and
+the server mints a token for any sub-account on demand. **A sub-account added next month
+works with no config change** — `ghl_list_locations` reads the live installed list, and a
+tool call naming a sub-account by name resolves against it.
+
+### Why not an agency Private Integration Token
+
+Because HighLevel's specs do not allow it, and the distinction is easy to miss. Each
+endpoint declares a security scheme:
+
+| Scheme | Accepts | Endpoints |
+| --- | --- | --- |
+| `bearer` | Sub-Account token **or sub-account PIT** | 325 |
+| `Location-Access` | Sub-Account token **or sub-account PIT** | 193 |
+| `Agency-Access` | Agency token **or agency PIT** | 102 |
+| `Location-Access-Only` | Sub-Account OAuth token only | 9 |
+| `Agency-Access-Only` | Agency OAuth token only — **PIT excluded** | 3 |
+
+`POST /oauth/locationToken` is `Agency-Access-Only`, described as *"Access Token generated
+with user type as Agency"* — without the *"(OR) Private Integration Token of Agency"*
+clause that `Agency-Access` carries. So an agency PIT can neither mint location tokens nor
+call the 518 sub-account endpoints. An agency PIT *can* call `GET /locations/search`, which
+solves discovery but not access.
+
+### The refresh token must be persisted
+
+HighLevel returns a **new refresh token on every exchange**. Lose it and the agency
+connection is dead until someone re-installs the app by hand. Two consequences:
+
+- `GHL_TOKEN_STORE` must point at durable storage. On Render that means the disk in
+  `render.yaml`; the server logs a loud warning at boot if the variable is unset.
+- **Run one instance.** Two replicas would rotate each other's refresh tokens and both
+  end up holding invalid ones. The Render disk enforces this by pinning the service to a
+  single instance, which is the behaviour we want rather than a limitation.
+
+A rejected refresh token reports exactly this cause rather than a bare `invalid_grant`.
+
+### Tokens in flight
+
+The agency access token is cached until a minute before expiry, and concurrent callers
+share one exchange rather than racing. Location tokens are cached per sub-account with
+the same margin. No token is ever written into a tool result: `ghl_list_locations`
+serves a token-free projection, and the tests assert it.
+
 ### How a location reaches the API
 
 HighLevel spells "which sub-account" three ways, and the default fills all of them:

@@ -88,10 +88,59 @@ const allowedHosts = [
   ]),
 ];
 
+// The marketplace app redirects here after an agency install. It is outside the
+// MCP bearer gate because HighLevel's redirect cannot carry that header, so the
+// only thing that makes it safe is that an authorization code is single-use,
+// short-lived, and worthless without the client secret this process holds.
+const installState = process.env.GHL_INSTALL_STATE?.trim();
+
+async function handleOAuthCallback(url: URL, res: ServerResponse): Promise<void> {
+  if (!config.oauth) {
+    sendJson(res, 404, { error: 'Agency OAuth is not configured on this server.' });
+    return;
+  }
+  const error = url.searchParams.get('error');
+  if (error) {
+    log(`Install callback returned an error: ${error}`);
+    sendJson(res, 400, { error: `HighLevel reported: ${error}` });
+    return;
+  }
+  // Optional shared nonce. Set GHL_INSTALL_STATE and include it in the redirect
+  // URI so a stray GET cannot spend a code you did not initiate.
+  if (installState && url.searchParams.get('state') !== installState) {
+    sendJson(res, 403, { error: 'state mismatch' });
+    return;
+  }
+  const code = url.searchParams.get('code');
+  if (!code) {
+    sendJson(res, 400, { error: 'No authorization code in the callback.' });
+    return;
+  }
+  try {
+    await config.oauth.agency.exchangeAuthorizationCode(code, config.oauth.redirectUri);
+    log(`Agency authorised. Refresh token stored in ${config.oauth.store.describe}.`);
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('GoHighLevel agency connected. You can close this tab.\n');
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    log(`Install callback failed: ${message}`);
+    // The code is spent either way, so say plainly that the install must restart.
+    sendJson(res, 502, { error: `Token exchange failed: ${message}. Re-run the install from the marketplace app.` });
+  }
+}
+
 const httpServer = createHttpServer(async (req, res) => {
   const url = new URL(req.url ?? '/', 'http://localhost');
   if (url.pathname === '/health') {
     sendJson(res, 200, { ok: true });
+    return;
+  }
+  if (url.pathname === '/oauth/callback') {
+    if (req.method !== 'GET') {
+      sendJson(res, 405, { error: 'Method not allowed' });
+      return;
+    }
+    await handleOAuthCallback(url, res);
     return;
   }
   if (url.pathname !== '/mcp') {
@@ -131,6 +180,15 @@ const httpServer = createHttpServer(async (req, res) => {
 
 httpServer.listen(port, host, () => {
   log(`Streamable HTTP listening on http://${host}:${port}/mcp`);
+  if (config.oauth) {
+    log(`Agency OAuth mode. Install callback: /oauth/callback. Token store: ${config.oauth.store.describe}.`);
+    if (!process.env.GHL_TOKEN_STORE?.trim()) {
+      log('WARNING: GHL_TOKEN_STORE is not set. HighLevel rotates the refresh token on every exchange, so this instance will lose the agency connection on restart and need re-authorising. Point it at a persistent disk.');
+    }
+    if (!config.oauth.appId) {
+      log('Note: GHL_APP_ID is not set, so ghl_list_locations cannot enumerate installed sub-accounts. Location ids still work.');
+    }
+  }
   log(`Accepted Host headers: ${allowedHosts.join(', ')} (add more with MCP_ALLOWED_HOSTS).`);
   if (!LOOPBACK_HOSTS.has(host)) {
     log(`MCP_BIND_HOST=${host} exposes this process beyond the machine. Terminate TLS in front of it: the bearer token and every CRM record cross the wire in cleartext otherwise.`);

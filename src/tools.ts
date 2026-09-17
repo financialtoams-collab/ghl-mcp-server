@@ -239,7 +239,10 @@ export function resolveTarget(endpoint: EndpointDef, args: ToolArgs, config: Ser
   const requested = requestedField ? String(args[requestedField]) : undefined;
 
   const entry = registry.resolve(requested);
-  if (requested !== undefined && !entry && registry.size > 1) {
+  // In OAuth mode any sub-account the app is installed on is valid, including
+  // ones discovered after boot, so an unrecognised value is passed through and
+  // the token mint reports it precisely if the app is not installed there.
+  if (requested !== undefined && !entry && registry.size > 1 && !config.oauth) {
     throw new Error(
       `Unknown location "${requested}". Configured sub-accounts: ${registry.aliases().join(', ')}. Use ghl_list_locations to see aliases and ids.`,
     );
@@ -258,6 +261,44 @@ export function resolveTarget(endpoint: EndpointDef, args: ToolArgs, config: Ser
   return { entry, locationId, token: registry.tokenFor(entry) ?? config.apiKey, args: next };
 }
 
+/**
+ * The token this call travels with. In OAuth mode it is minted (and cached) for
+ * the target sub-account; otherwise it is the registry's stored PIT. An agency
+ * endpoint — one with no location field — uses the agency token directly, since
+ * a location token would be refused there.
+ */
+/**
+ * OAuth mode only: swap a sub-account name for its id using live discovery.
+ * The static registry cannot help here — at this scale the sub-accounts are not
+ * in any env var, they are whatever the agency has today.
+ */
+export async function resolveDynamicLocation(
+  endpoint: EndpointDef,
+  args: ToolArgs,
+  config: ServerConfig,
+): Promise<ToolArgs> {
+  if (!config.oauth) return args;
+  const { idFields } = locationFieldsOf(endpoint);
+  const field = idFields.find((name) => !isBlank(args[name]));
+  if (!field) return args;
+  const requested = String(args[field]);
+  // Already a location id we know, or resolvable from the static registry: leave it.
+  if (registryOf(config).resolve(requested)) return args;
+  const found = await config.oauth.directory.resolve(requested);
+  if (!found || found.locationId === requested) return args;
+  const next: ToolArgs = { ...args };
+  for (const name of idFields) {
+    if (!isBlank(next[name])) next[name] = found.locationId;
+  }
+  return next;
+}
+
+export async function tokenForTarget(config: ServerConfig, target: ResolvedTarget): Promise<string | undefined> {
+  if (!config.oauth) return target.token;
+  if (!target.locationId) return config.oauth.agency.token();
+  return config.oauth.locations.tokenFor(target.locationId);
+}
+
 export async function executeEndpoint(
   endpoint: EndpointDef,
   args: ToolArgs,
@@ -274,8 +315,12 @@ export async function executeEndpoint(
     if (!parsed.success) {
       return formatError(new Error(`Invalid arguments for ${endpoint.name}: ${z.prettifyError(parsed.error)}`), endpoint);
     }
+    // A name like "toams" is resolved against the live installed-sub-account
+    // list before routing, so the model never has to carry location ids around.
+    const located = await resolveDynamicLocation(endpoint, parsed.data as ToolArgs, config);
     // Alias -> real id -> that sub-account's token, before anything is routed.
-    const target = resolveTarget(endpoint, parsed.data as ToolArgs, config);
+    const target = resolveTarget(endpoint, located, config);
+    const token = await tokenForTarget(config, target);
     const { pathParams, query, body } = splitArguments(endpoint, target.args, target.locationId);
     const data = await client.request({
       method: endpoint.method,
@@ -285,7 +330,7 @@ export async function executeEndpoint(
       query,
       body,
       contentType: endpoint.contentType,
-      token: target.token,
+      token,
     });
     return formatResult(data);
   } catch (error) {

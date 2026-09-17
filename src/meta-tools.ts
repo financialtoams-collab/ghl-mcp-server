@@ -62,16 +62,28 @@ export function registerMetaTools(
 
   // Only worth a tool when there is a choice to make. describe() is token-free by
   // construction, so no Private Integration Token can reach a tool result this way.
-  if (registry.size > 1) {
+  if (registry.size > 1 || config.oauth) {
     server.registerTool(
       'ghl_list_locations',
       {
-        title: 'List configured GHL sub-accounts',
-        description: `List the ${registry.size} GoHighLevel sub-accounts this server is configured for, with the alias to pass as locationId (or altId) on any tool. Omitting the location uses the default. Returns no credentials.`,
+        title: 'List GHL sub-accounts',
+        description: config.oauth
+          ? 'List every GoHighLevel sub-account this agency app is installed on, with its name and location id. Pass the name or the id as locationId (or altId) on any tool to target it. The list is live, so sub-accounts added after startup appear here. Returns no credentials.'
+          : `List the ${registry.size} GoHighLevel sub-accounts this server is configured for, with the alias to pass as locationId (or altId) on any tool. Omitting the location uses the default. Returns no credentials.`,
         inputSchema: z.object({}),
         annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       },
-      async () => formatResult({ count: registry.size, locations: registry.describe() }),
+      async () => {
+        if (config.oauth) {
+          try {
+            const discovered = await config.oauth.directory.describe();
+            return formatResult({ count: discovered.length, source: 'installed sub-accounts', locations: discovered });
+          } catch (error) {
+            return formatError(error);
+          }
+        }
+        return formatResult({ count: registry.size, locations: registry.describe() });
+      },
     );
   }
 
