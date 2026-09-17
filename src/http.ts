@@ -2,7 +2,7 @@ import { createServer as createHttpServer, type IncomingMessage, type ServerResp
 import { timingSafeEqual } from 'node:crypto';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { loadEndpoints } from './catalog.ts';
-import { loadConfig } from './config.ts';
+import { loadConfig, type ServerConfig } from './config.ts';
 import { createServer } from './server.ts';
 
 const log = (message: string): void => {
@@ -52,7 +52,20 @@ if (!authToken) {
   process.exit(1);
 }
 
-const config = loadConfig();
+// Booting unconfigured is deliberate, not sloppiness. The install flow is
+// circular: the marketplace app's Redirect URL needs this service's hostname,
+// and the hostname does not exist until the service deploys. Exiting on missing
+// credentials would mean a crash-looping first deploy that never yields a
+// hostname to register. So the server starts, answers /health so the platform
+// marks the deploy live, and refuses actual tool calls with the reason.
+let config: ServerConfig | undefined;
+let configError: string | undefined;
+try {
+  config = loadConfig();
+} catch (error) {
+  configError = error instanceof Error ? error.message : String(error);
+}
+
 const port = Number(process.env.PORT ?? 3000);
 // listen() without a host binds every interface, which put a full-CRM proxy on the
 // LAN while the startup line claimed localhost. Loopback unless asked otherwise.
@@ -61,8 +74,8 @@ const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1']);
 
 // Parsed once: createServer runs per request, and loadEndpoints is a synchronous
 // multi-megabyte JSON parse that would block the event loop on every call.
-const endpoints = loadEndpoints(config.modules);
-const catalog = config.metaTools && config.modules !== 'all' ? loadEndpoints('all') : endpoints;
+const endpoints = config ? loadEndpoints(config.modules) : [];
+const catalog = config && config.metaTools && config.modules !== 'all' ? loadEndpoints('all') : endpoints;
 
 // DNS rebinding: a hostile page can make a browser resolve its own domain to this
 // address, but it cannot forge the Host header. An empty allowedOrigins list is a
@@ -95,7 +108,7 @@ const allowedHosts = [
 const installState = process.env.GHL_INSTALL_STATE?.trim();
 
 async function handleOAuthCallback(url: URL, res: ServerResponse): Promise<void> {
-  if (!config.oauth) {
+  if (!config?.oauth) {
     sendJson(res, 404, { error: 'Agency OAuth is not configured on this server.' });
     return;
   }
@@ -132,7 +145,9 @@ async function handleOAuthCallback(url: URL, res: ServerResponse): Promise<void>
 const httpServer = createHttpServer(async (req, res) => {
   const url = new URL(req.url ?? '/', 'http://localhost');
   if (url.pathname === '/health') {
-    sendJson(res, 200, { ok: true });
+    // 200 even when unconfigured, so the platform marks the deploy live and a
+    // hostname exists to register — but `configured` says what is actually true.
+    sendJson(res, 200, { ok: true, configured: config !== undefined });
     return;
   }
   if (url.pathname === '/oauth/callback') {
@@ -149,6 +164,10 @@ const httpServer = createHttpServer(async (req, res) => {
   }
   if (!isAuthorized(req, authToken)) {
     sendJson(res, 401, { error: 'Unauthorized' });
+    return;
+  }
+  if (!config) {
+    sendJson(res, 503, { error: `Server is running but not configured: ${configError}` });
     return;
   }
   if (req.method !== 'POST') {
@@ -180,12 +199,16 @@ const httpServer = createHttpServer(async (req, res) => {
 
 httpServer.listen(port, host, () => {
   log(`Streamable HTTP listening on http://${host}:${port}/mcp`);
-  if (config.oauth) {
+  if (!config) {
+    log(`NOT CONFIGURED: ${configError}`);
+    log('The server is up and /health answers, so the deploy is live and you have a hostname. Set the credentials, then redeploy.');
+  }
+  if (config?.oauth) {
     log(`Agency OAuth mode. Install callback: /oauth/callback. Token store: ${config.oauth.store.describe}.`);
     if (!process.env.GHL_TOKEN_STORE?.trim()) {
       log('WARNING: GHL_TOKEN_STORE is not set. HighLevel rotates the refresh token on every exchange, so this instance will lose the agency connection on restart and need re-authorising. Point it at a persistent disk.');
     }
-    if (!config.oauth.appId) {
+    if (!config.oauth?.appId) {
       log('Note: GHL_APP_ID is not set, so ghl_list_locations cannot enumerate installed sub-accounts. Location ids still work.');
     }
   }

@@ -289,6 +289,14 @@ domain in front.
 
 `Dockerfile` and `render.yaml` are in the repo, so this is a blueprint deploy.
 
+**The order matters, because the setup is circular:** the marketplace app's Redirect
+URL needs this service's hostname, and the hostname does not exist until the service has
+deployed. So the first deploy runs without GoHighLevel credentials. That is supported
+rather than accidental — the server starts, `/health` answers `{"ok":true,"configured":
+false}` so the platform marks the deploy live, the startup log says exactly what is
+missing, and `/mcp` returns 503 with the reason instead of pretending to work. Fill the
+credentials in afterwards and redeploy.
+
 1. **Render → New → Blueprint**, point it at this repo. It reads `render.yaml`.
 2. Fill the values marked `sync: false` in the dashboard: `GHL_LOCATIONS`,
    `GHL_DEFAULT_LOCATION`, and optionally `GHL_API_KEY`. Adjust `GHL_MODULES` if the
