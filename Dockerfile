@@ -4,9 +4,12 @@
 FROM node:22-alpine AS build
 WORKDIR /app
 
-# Dev dependencies are needed here: the "prepare" script compiles with tsc.
+# Dev dependencies are needed here (tsc lives in them), but --ignore-scripts is
+# load-bearing: package.json's "prepare" hook runs `npm run build`, and at this
+# layer tsconfig.json and src/ have not been copied yet, so tsc exits 1 and the
+# whole image build fails. The explicit `npm run build` below is what compiles.
 COPY package.json package-lock.json ./
-RUN npm ci
+RUN npm ci --ignore-scripts
 
 COPY tsconfig.json ./
 COPY src ./src
