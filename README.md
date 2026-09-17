@@ -57,6 +57,7 @@ Create. Enable the scopes for the endpoints you plan to use (e.g. `contacts.read
 | `PORT` | `3000` | HTTP transport port |
 | `MCP_BIND_HOST` | `127.0.0.1` | HTTP bind address. Anything but loopback exposes the server to the network |
 | `MCP_ALLOWED_HOSTS` | — | Extra `Host` headers to accept, comma-separated. Needed behind a reverse proxy |
+| `MCP_PUBLIC_URL` | platform hostname | Public base URL used as the OAuth issuer. Detected from Render/Fly/Railway; set it for a custom domain |
 | `GITHUB_TOKEN` | — | Lifts GitHub's rate limit for `npm run specs:fetch` |
 
 `GHL_MODULES` is not a security boundary. With `GHL_META_TOOLS=true` (the default),
@@ -305,8 +306,10 @@ credentials in afterwards and redeploy.
    client must send, and Render generates it so it never lives in the repo.
 4. Wait for the deploy, then confirm `https://<service>.onrender.com/health` returns
    `{"ok":true}`.
-5. In Claude, add a **Custom Connector** pointing at `https://<service>.onrender.com/mcp`
-   with header `Authorization: Bearer <MCP_AUTH_TOKEN>`.
+5. In Claude: **Settings → Connectors → Add custom connector**, URL
+   `https://<service>.onrender.com/mcp`. Leave the OAuth fields blank — the server
+   registers Claude dynamically. Claude opens a consent page; paste `MCP_AUTH_TOKEN`
+   there once and the connection is made. See [Authentication](#authentication) below.
 
 `render.yaml` ships with `GHL_ALLOW_WRITES=true` and `GHL_ALLOW_DELETES=false`. Turn
 deletes on only deliberately, and never alongside a client set to auto-approve tool
@@ -320,6 +323,46 @@ Two things worth being clear-eyed about before this is reachable from the intern
   Render env var, which redeploys.
 - Render's free instances sleep when idle, which surfaces as a slow first tool call
   while the container wakes. `render.yaml` uses `starter` for that reason.
+
+## Authentication
+
+Claude's custom-connector UI accepts a server URL and, optionally, an OAuth client id
+and secret. It has **no field for a static bearer token**, so the `MCP_AUTH_TOKEN` header
+alone cannot be used from there. This server is therefore an OAuth 2.1 resource server
+with an authorization server built into the same process, per the MCP authorization spec:
+
+| Endpoint | Purpose |
+| --- | --- |
+| `/.well-known/oauth-protected-resource` | RFC 9728 — names the authorization server |
+| `/.well-known/oauth-authorization-server` | RFC 8414 — endpoints and capabilities |
+| `POST /register` | RFC 7591 dynamic client registration |
+| `GET/POST /authorize` | consent screen, then an authorization code |
+| `POST /token` | code → tokens, and refresh |
+
+An unauthenticated call to `/mcp` answers `401` with a `WWW-Authenticate` header pointing
+at discovery, which is how a client finds the rest without configuration.
+
+**Approving a connector asks for `MCP_AUTH_TOKEN`.** There is no "click to approve"
+button, because approving grants full access to every configured sub-account. The consent
+page asks for the server's own secret as proof that whoever opened the URL is the
+operator and not merely someone who was sent the link.
+
+**Everything is stateless.** Client ids, authorization codes, access tokens and refresh
+tokens are values signed with a key derived from `MCP_AUTH_TOKEN` — nothing is written to
+disk, so a redeploy never breaks a working connector and no store has to be kept in sync.
+The only server-side state is a set of spent authorization codes, which lives 60 seconds.
+Rotating `MCP_AUTH_TOKEN` invalidates every issued token, which is the intended way to
+revoke a connector.
+
+Security properties worth stating, all covered by tests: PKCE `S256` is required and
+`plain` is not offered; codes are single-use and expire in 60 seconds; redirect URIs must
+be pre-registered and must be https (or loopback); tokens are audience-bound to this
+server's `/mcp` (RFC 8707), so a token minted for another resource is refused; the purpose
+of each signed value is inside its signature, so an access token cannot be replayed as a
+refresh token; and authorization responses carry `iss` (RFC 9207).
+
+The static `MCP_AUTH_TOKEN` bearer still works for `curl` and for the Messages API's MCP
+connector, which does accept an `authorization_token`.
 
 ## How the tools look
 

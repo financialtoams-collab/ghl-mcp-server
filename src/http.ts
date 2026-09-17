@@ -4,6 +4,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { loadEndpoints } from './catalog.ts';
 import { loadConfig, type ServerConfig } from './config.ts';
 import { createServer } from './server.ts';
+import { consentPage, McpOAuthProvider, MCP_SCOPE, OAuthError } from './mcp-oauth.ts';
 
 const log = (message: string): void => {
   process.stderr.write(`[ghl-mcp] ${message}\n`);
@@ -101,6 +102,134 @@ const allowedHosts = [
   ]),
 ];
 
+// The issuer has to be the URL a client actually reaches, because it is baked
+// into discovery documents and compared by the client (RFC 9207). Render exposes
+// its public hostname; MCP_PUBLIC_URL overrides for a custom domain.
+const publicBaseUrl = (
+  process.env.MCP_PUBLIC_URL?.trim() ||
+  (process.env.RENDER_EXTERNAL_HOSTNAME ? `https://${process.env.RENDER_EXTERNAL_HOSTNAME}` : '') ||
+  `http://${host}:${port}`
+).replace(/\/+$/, '');
+
+// Claude's connector UI has no bearer-token field, so OAuth is the only way in
+// from there. The static MCP_AUTH_TOKEN still works for curl and the Messages
+// API, and doubles as the secret that authorises an OAuth grant.
+const oauth = new McpOAuthProvider({ issuer: publicBaseUrl, adminToken: authToken });
+
+function readFormBody(req: IncomingMessage): Promise<URLSearchParams> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    req.on('data', (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > 64_000) reject(new Error('Body too large'));
+      else chunks.push(chunk);
+    });
+    req.on('end', () => {
+      const text = Buffer.concat(chunks).toString('utf8');
+      try {
+        // The token endpoint is form-encoded per OAuth, but some clients post JSON.
+        resolve(text.trim().startsWith('{')
+          ? new URLSearchParams(Object.entries(JSON.parse(text) as Record<string, string>))
+          : new URLSearchParams(text));
+      } catch {
+        resolve(new URLSearchParams(text));
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+function sendOAuthError(res: ServerResponse, error: unknown): void {
+  if (error instanceof OAuthError) {
+    sendJson(res, error.status, { error: error.code, error_description: error.message });
+    return;
+  }
+  sendJson(res, 400, { error: 'invalid_request', error_description: error instanceof Error ? error.message : String(error) });
+}
+
+/** GET /authorize — show consent; POST /authorize — verify the secret, issue a code. */
+async function handleAuthorize(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+  const params = url.searchParams;
+  const client = oauth.clientFor(params.get('client_id') ?? undefined);
+  const redirectUri = params.get('redirect_uri') ?? '';
+  if (!client) {
+    sendJson(res, 400, { error: 'invalid_client', error_description: 'Unknown or malformed client_id. Register first.' });
+    return;
+  }
+  // Never redirect to an unregistered URI: that is how an authorization code is
+  // handed to someone else's server.
+  if (!client.redirect_uris.includes(redirectUri)) {
+    sendJson(res, 400, { error: 'invalid_request', error_description: 'redirect_uri was not registered for this client.' });
+    return;
+  }
+  if (params.get('response_type') !== 'code') {
+    sendJson(res, 400, { error: 'unsupported_response_type', error_description: 'Only response_type=code is supported.' });
+    return;
+  }
+  const challenge = params.get('code_challenge');
+  if (!challenge || params.get('code_challenge_method') !== 'S256') {
+    sendJson(res, 400, { error: 'invalid_request', error_description: 'PKCE with code_challenge_method=S256 is required.' });
+    return;
+  }
+
+  if (req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(consentPage({ clientName: client.client_name ?? undefined, query: params.toString() }));
+    return;
+  }
+
+  const form = await readFormBody(req);
+  if (!oauth.isAdmin(form.get('secret'))) {
+    res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(consentPage({ clientName: client.client_name ?? undefined, query: params.toString(), error: 'That token was not correct.' }));
+    return;
+  }
+
+  const code = oauth.issueCode({
+    clientId: client.client_id,
+    redirectUri,
+    codeChallenge: challenge,
+    scope: params.get('scope') || MCP_SCOPE,
+    resource: params.get('resource') ?? undefined,
+  });
+  const location = new URL(redirectUri);
+  location.searchParams.set('code', code);
+  const state = params.get('state');
+  if (state) location.searchParams.set('state', state);
+  // RFC 9207 — lets the client detect an authorization-server mix-up.
+  location.searchParams.set('iss', oauth.issuer);
+  log('Authorized an MCP connector.');
+  res.writeHead(302, { Location: location.toString() });
+  res.end();
+}
+
+async function handleToken(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const form = await readFormBody(req);
+  try {
+    const grant = form.get('grant_type');
+    const tokens = grant === 'refresh_token'
+      ? oauth.refresh({
+          refreshToken: form.get('refresh_token') ?? '',
+          clientId: form.get('client_id') ?? undefined,
+          resource: form.get('resource') ?? undefined,
+        })
+      : grant === 'authorization_code'
+        ? oauth.exchangeCode({
+            code: form.get('code') ?? '',
+            codeVerifier: form.get('code_verifier') ?? undefined,
+            redirectUri: form.get('redirect_uri') ?? undefined,
+            clientId: form.get('client_id') ?? undefined,
+            resource: form.get('resource') ?? undefined,
+          })
+        : (() => { throw new OAuthError('unsupported_grant_type', `grant_type "${grant}" is not supported.`); })();
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    res.end(JSON.stringify(tokens));
+  } catch (error) {
+    sendOAuthError(res, error);
+  }
+}
+
 // The marketplace app redirects here after an agency install. It is outside the
 // MCP bearer gate because HighLevel's redirect cannot carry that header, so the
 // only thing that makes it safe is that an authorization code is single-use,
@@ -150,6 +279,34 @@ const httpServer = createHttpServer(async (req, res) => {
     sendJson(res, 200, { ok: true, configured: config !== undefined });
     return;
   }
+  // --- OAuth discovery and endpoints (unauthenticated by design) -----------
+  if (url.pathname === '/.well-known/oauth-protected-resource'
+      || url.pathname === '/.well-known/oauth-protected-resource/mcp') {
+    sendJson(res, 200, oauth.protectedResourceMetadata());
+    return;
+  }
+  if (url.pathname === '/.well-known/oauth-authorization-server'
+      || url.pathname === '/.well-known/openid-configuration') {
+    sendJson(res, 200, oauth.authorizationServerMetadata());
+    return;
+  }
+  if (url.pathname === '/register' && req.method === 'POST') {
+    try {
+      sendJson(res, 201, oauth.register((await readJsonBody(req)) as Record<string, unknown> ?? {}));
+    } catch (error) {
+      sendOAuthError(res, error);
+    }
+    return;
+  }
+  if (url.pathname === '/authorize' && (req.method === 'GET' || req.method === 'POST')) {
+    await handleAuthorize(req, res, url);
+    return;
+  }
+  if (url.pathname === '/token' && req.method === 'POST') {
+    await handleToken(req, res);
+    return;
+  }
+
   if (url.pathname === '/oauth/callback') {
     if (req.method !== 'GET') {
       sendJson(res, 405, { error: 'Method not allowed' });
@@ -162,8 +319,17 @@ const httpServer = createHttpServer(async (req, res) => {
     sendJson(res, 404, { error: 'Not found' });
     return;
   }
-  if (!isAuthorized(req, authToken)) {
-    sendJson(res, 401, { error: 'Unauthorized' });
+  const presented = (req.headers.authorization ?? '').startsWith('Bearer ')
+    ? (req.headers.authorization as string).slice('Bearer '.length)
+    : '';
+  // Either an OAuth access token minted above, or the static MCP_AUTH_TOKEN,
+  // which keeps curl and the Messages API's authorization_token working.
+  const oauthClaims = oauth.verifyAccessToken(presented);
+  if (!oauthClaims && !isAuthorized(req, authToken)) {
+    // The challenge is what tells a client where to discover the auth server;
+    // without it Claude cannot begin the flow at all.
+    res.writeHead(401, { 'Content-Type': 'application/json', 'WWW-Authenticate': oauth.wwwAuthenticate('invalid_token', 'A valid access token is required.') });
+    res.end(JSON.stringify({ error: 'Unauthorized' }));
     return;
   }
   if (!config) {
@@ -199,6 +365,7 @@ const httpServer = createHttpServer(async (req, res) => {
 
 httpServer.listen(port, host, () => {
   log(`Streamable HTTP listening on http://${host}:${port}/mcp`);
+  log(`Public URL for connectors: ${publicBaseUrl}/mcp (OAuth discovery at ${publicBaseUrl}/.well-known/oauth-protected-resource)`);
   if (!config) {
     log(`NOT CONFIGURED: ${configError}`);
     log('The server is up and /health answers, so the deploy is live and you have a hostname. Set the credentials, then redeploy.');

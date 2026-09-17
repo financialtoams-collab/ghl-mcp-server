@@ -96,3 +96,8 @@ services:
       # you put a custom domain in front.
       - key: MCP_BIND_HOST
         value: 0.0.0.0
+
+      # OAuth issuer for the Claude connector. Detected from
+      # RENDER_EXTERNAL_HOSTNAME automatically; set it only for a custom domain.
+      # - key: MCP_PUBLIC_URL
+      #   value: https://ghl.yourdomain.com
