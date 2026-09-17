@@ -121,3 +121,46 @@ test('inputSchemaFor relaxes a required locationId only when a default location 
   assert.equal(inputSchemaFor(def).safeParse({}).success, false);
   assert.equal(inputSchemaFor(def, 'LOC1').safeParse({}).success, true);
 });
+
+const altEndpoint = (overrides: Partial<EndpointDef> = {}): EndpointDef =>
+  endpoint({
+    name: 'invoices_list',
+    module: 'invoices',
+    method: 'GET',
+    path: '/invoices/',
+    operationClass: 'read',
+    pathFields: [],
+    queryFields: ['altId', 'altType', 'limit'],
+    bodyFields: [],
+    inputSchema: {
+      type: 'object',
+      properties: { altId: { type: 'string' }, altType: { type: 'string', enum: ['location'] }, limit: { type: 'string' } },
+      required: ['altId', 'altType'],
+    },
+    ...overrides,
+  });
+
+test('splitArguments fills altId and altType from the default location', () => {
+  const split = splitArguments(altEndpoint(), { limit: '5' }, 'LOC1');
+  assert.deepEqual(split.query, { altId: 'LOC1', altType: 'location', limit: '5' });
+});
+
+test('splitArguments leaves altId alone when altType scopes the call to a company', () => {
+  // altId is "location id / company id based on altType". Filling a location id in
+  // when the caller said company would silently retarget the request.
+  const split = splitArguments(altEndpoint(), { altType: 'company' }, 'LOC1');
+  assert.equal(split.query.altId, undefined);
+  assert.equal(split.query.altType, 'company');
+});
+
+test('splitArguments treats an explicit null altId as absent, like locationId', () => {
+  const split = splitArguments(altEndpoint(), { altId: null, altType: null }, 'LOC1');
+  assert.deepEqual(split.query, { altId: 'LOC1', altType: 'location' });
+});
+
+test('inputSchemaFor drops altId and altType from required so the default can fill them', () => {
+  const schema = inputSchemaFor(altEndpoint(), 'LOC1');
+  assert.equal(schema.safeParse({ limit: '5' }).success, true);
+  // and with no default location configured, the spec's own requirement still holds
+  assert.equal(inputSchemaFor(altEndpoint({ name: 'invoices_list_nodefault' }), undefined).safeParse({ limit: '5' }).success, false);
+});

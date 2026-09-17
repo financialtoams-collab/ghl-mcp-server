@@ -67,11 +67,23 @@ const catalog = config.metaTools && config.modules !== 'all' ? loadEndpoints('al
 // DNS rebinding: a hostile page can make a browser resolve its own domain to this
 // address, but it cannot forge the Host header. An empty allowedOrigins list is a
 // no-op in the SDK, so the Host allowlist is what actually holds.
+// Behind a platform proxy the Host header is the public hostname with no port,
+// so the loopback entries never match and the deploy 421s on every request.
+// Render sets RENDER_EXTERNAL_HOSTNAME; Fly sets FLY_APP_NAME. Picking these up
+// automatically is what keeps MCP_ALLOWED_HOSTS from being a required, easily
+// forgotten step — it stays available for anything else in front of the server.
+const platformHostnames = [
+  process.env.RENDER_EXTERNAL_HOSTNAME,
+  process.env.FLY_APP_NAME ? `${process.env.FLY_APP_NAME}.fly.dev` : undefined,
+  process.env.RAILWAY_PUBLIC_DOMAIN,
+].filter((value): value is string => Boolean(value?.trim()));
+
 const allowedHosts = [
   ...new Set([
     `${host}:${port}`,
     `localhost:${port}`,
     `127.0.0.1:${port}`,
+    ...platformHostnames.flatMap((hostname) => [hostname, `${hostname}:443`]),
     ...(process.env.MCP_ALLOWED_HOSTS?.split(',').map((entry) => entry.trim()).filter(Boolean) ?? []),
   ]),
 ];

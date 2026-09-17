@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+          cache: npm
+
+      # --ignore-scripts so the build is an explicit, separately reported step
+      # rather than a side effect of the "prepare" lifecycle hook.
+      - run: npm ci --ignore-scripts
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: node --test "dist/test/*.test.js"
+
+      # The committed catalog is what a fresh clone runs on. If it no longer
+      # matches what the generator produces from the committed specs, the two
+      # have drifted and the clone is serving stale tool definitions.
+      - name: Catalog matches the committed specs
+        run: |
+          npm run generate
+          if ! git diff --quiet -- generated; then
+            echo "::error::generated/ is out of date with specs/. Run 'npm run generate' and commit the result."
+            git diff --stat -- generated
+            exit 1
+          fi
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The deploy path is the Dockerfile, so a broken one should fail here and
+      # not on Render. Build only: nothing is pushed anywhere.
+      - name: Build the image
+        run: docker build -t ghl-mcp-server:ci .

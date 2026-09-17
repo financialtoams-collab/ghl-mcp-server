@@ -3,7 +3,7 @@ import { z } from 'zod';
 import type { GhlClient } from './client.ts';
 import type { ServerConfig } from './config.ts';
 import type { EndpointDef } from './generator/openapi.ts';
-import { blockedReason, executeEndpoint, formatError, formatResult } from './tools.ts';
+import { blockedReason, executeEndpoint, formatError, formatResult, registryOf } from './tools.ts';
 
 const DEFAULT_SEARCH_LIMIT = 20;
 const MAX_SEARCH_LIMIT = 100;
@@ -58,6 +58,22 @@ export function registerMetaTools(
 ): void {
   const byName = new Map(catalog.map((endpoint) => [endpoint.name, endpoint]));
   const modules = [...new Set(catalog.map((endpoint) => endpoint.module))].sort();
+  const registry = registryOf(config);
+
+  // Only worth a tool when there is a choice to make. describe() is token-free by
+  // construction, so no Private Integration Token can reach a tool result this way.
+  if (registry.size > 1) {
+    server.registerTool(
+      'ghl_list_locations',
+      {
+        title: 'List configured GHL sub-accounts',
+        description: `List the ${registry.size} GoHighLevel sub-accounts this server is configured for, with the alias to pass as locationId (or altId) on any tool. Omitting the location uses the default. Returns no credentials.`,
+        inputSchema: z.object({}),
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      },
+      async () => formatResult({ count: registry.size, locations: registry.describe() }),
+    );
+  }
 
   server.registerTool(
     'ghl_search_endpoints',

@@ -4,7 +4,7 @@ import { GhlClient } from './client.ts';
 import type { ServerConfig } from './config.ts';
 import type { EndpointDef } from './generator/openapi.ts';
 import { registerMetaTools } from './meta-tools.ts';
-import { registerEndpointTools } from './tools.ts';
+import { registerEndpointTools, registryOf } from './tools.ts';
 
 export const SERVER_NAME = 'ghl-mcp-server';
 export const SERVER_VERSION = '0.1.0';
@@ -23,6 +23,7 @@ export function createServer(config: ServerConfig, options: CreateServerOptions 
   const client = options.client ?? new GhlClient({ apiKey: config.apiKey, baseUrl: config.baseUrl });
   const log = options.log ?? (() => {});
 
+  const registry = registryOf(config);
   const selected = options.endpoints ?? loadEndpoints(config.modules);
   const gates = [
     `writes ${config.allowWrites ? 'enabled' : 'disabled'}`,
@@ -35,9 +36,11 @@ export function createServer(config: ServerConfig, options: CreateServerOptions 
       instructions: [
         'GoHighLevel API server generated from HighLevel\'s official OpenAPI specs.',
         `Loaded modules: ${config.modules === 'all' ? 'all' : config.modules.join(', ')}. Safety gates: ${gates}.`,
-        config.locationId
-          ? `locationId defaults to ${config.locationId} when omitted.`
-          : 'No default location is configured; pass locationId explicitly.',
+        registry.size > 1
+          ? `${registry.size} sub-accounts are configured: ${registry.aliases().join(', ')}. Pass the alias as locationId (or altId on invoices, payments, store and products) to target one; omit it for the default, ${registry.defaultEntry?.alias}. Each sub-account uses its own token, so a call never crosses into another one. ghl_list_locations shows the aliases and ids.`
+          : config.locationId
+            ? `locationId defaults to ${config.locationId} when omitted, including the altId field used by invoices, payments, store and products.`
+            : 'No default location is configured; pass locationId explicitly.',
         config.metaTools
           ? 'Use ghl_search_endpoints to discover endpoints outside the loaded modules, then ghl_call_endpoint to run them.'
           : '',

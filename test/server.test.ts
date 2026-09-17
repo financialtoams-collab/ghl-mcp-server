@@ -108,10 +108,11 @@ test('ghl_call_endpoint validates arguments against the endpoint schema', async 
   const mcp = await connect(baseConfig, client);
 
   // The meta-tool path used to skip inputSchemaFor entirely, so anything the model
-  // invented went straight onto the wire.
+  // invented went straight onto the wire. altId/altType are no longer part of what
+  // can be missing here: the default location fills them (see the altId tests below).
   const missing = await mcp.callTool({ name: 'ghl_call_endpoint', arguments: { name: 'invoices_list_invoices', arguments: { limit: '5' } } });
   assert.equal(missing.isError, true);
-  assert.match(textOf(missing as never), /altId/);
+  assert.match(textOf(missing as never), /offset/);
   assert.equal(requests.length, 0, 'an invalid call never reaches the API');
 
   // null used to slip past the `=== undefined` guard and silently cancel GHL_LOCATION_ID.
@@ -177,4 +178,34 @@ test('every path placeholder has an argument, so no tool is dead on arrival', ()
       .map((name) => `${endpoint.name} needs {${name}}`),
   );
   assert.deepEqual(orphans, []);
+});
+
+test('a default location fills altId and altType on the modules that scope that way', async () => {
+  const { client, requests } = stubClient(() => ({ invoices: [] }));
+  const mcp = await connect({ ...baseConfig, modules: ['invoices'] }, client);
+
+  // invoices/payments/store/products scope by altId+altType, not locationId. Before
+  // this, a configured default location did nothing for 99 endpoints.
+  const result = await mcp.callTool({
+    name: 'ghl_call_endpoint',
+    arguments: { name: 'invoices_list_invoices', arguments: { limit: '5', offset: '0' } },
+  });
+  assert.equal(result.isError, undefined, textOf(result as never));
+  const query = requests[0].query as Record<string, unknown>;
+  assert.equal(query.altId, 'LOC1');
+  assert.equal(query.altType, 'location');
+  await mcp.close();
+});
+
+test('an explicit altId is preserved rather than replaced by the default location', async () => {
+  const { client, requests } = stubClient(() => ({ ok: true }));
+  const mcp = await connect({ ...baseConfig, modules: ['invoices'] }, client);
+
+  await mcp.callTool({
+    name: 'ghl_call_endpoint',
+    arguments: { name: 'invoices_list_invoices', arguments: { altId: 'OTHERLOC', altType: 'location', limit: '5', offset: '0' } },
+  });
+  const query = requests[0].query as Record<string, unknown>;
+  assert.equal(query.altId, 'OTHERLOC');
+  await mcp.close();
 });

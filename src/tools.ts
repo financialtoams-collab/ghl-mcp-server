@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { GhlApiError, type GhlClient } from './client.ts';
 import type { ServerConfig } from './config.ts';
 import type { EndpointDef, OperationClass } from './generator/openapi.ts';
+import { buildRegistry, type LocationEntry, LocationRegistry } from './locations.ts';
 
 // Keeps a single tool response from flooding the model's context window.
 export const CHARACTER_LIMIT = 50_000;
@@ -13,29 +14,83 @@ type ToolArgs = Record<string, unknown>;
 const schemaCache = new Map<string, z.ZodType>();
 
 /**
+ * HighLevel spells "which sub-account" three ways. `locationId` covers 340
+ * endpoints; invoices, payments, store and products use `altId` paired with
+ * `altType`, which is 99 more; one endpoint uses snake_case. Injecting a default
+ * into only the first spelling is why those modules used to demand the id on
+ * every call even with a default location configured.
+ */
+export const LOCATION_ID_FIELDS = ['locationId', 'location_id', 'altId'] as const;
+export const ALT_TYPE_FIELD = 'altType';
+const LOCATION_ALT_TYPE = 'location';
+
+function endpointFields(endpoint: EndpointDef): Set<string> {
+  return new Set([...endpoint.pathFields, ...endpoint.queryFields, ...endpoint.bodyFields]);
+}
+
+/** Which location-bearing fields this endpoint actually declares. */
+export function locationFieldsOf(endpoint: EndpointDef): { idFields: string[]; hasAltType: boolean } {
+  const fields = endpointFields(endpoint);
+  return {
+    idFields: LOCATION_ID_FIELDS.filter((field) => fields.has(field)),
+    hasAltType: fields.has(ALT_TYPE_FIELD),
+  };
+}
+
+function isBlank(value: unknown): boolean {
+  return value === undefined || value === null || value === '';
+}
+
+/** Lazily derived single-location registry for configs that predate GHL_LOCATIONS. */
+const fallbackRegistries = new WeakMap<ServerConfig, LocationRegistry>();
+
+export function registryOf(config: ServerConfig): LocationRegistry {
+  if (config.locations) return config.locations;
+  let registry = fallbackRegistries.get(config);
+  if (!registry) {
+    registry = buildRegistry(undefined, config.locationId, config.apiKey, undefined);
+    fallbackRegistries.set(config, registry);
+  }
+  return registry;
+}
+
+/**
  * Builds the Zod schema the SDK validates against. The SDK rejects calls before
  * the handler runs, so a required locationId must be relaxed here (not in the
  * handler) whenever a default location will be injected.
  */
-export function inputSchemaFor(endpoint: EndpointDef, defaultLocationId?: string): z.ZodType {
+export function inputSchemaFor(endpoint: EndpointDef, defaultLocationId?: string, aliasHint?: string): z.ZodType {
   const declared = endpoint.inputSchema.properties as Record<string, Record<string, unknown>> | undefined;
-  const relaxLocation = Boolean(defaultLocationId) && Boolean(declared?.locationId);
-  const cacheKey = `${endpoint.name}${relaxLocation ? ':default-location' : ''}`;
+  const { idFields, hasAltType } = locationFieldsOf(endpoint);
+  // Only relax fields the schema actually declares; altType is relaxed alongside an
+  // altId we are going to fill, never on its own.
+  const relaxable = defaultLocationId
+    ? [...idFields.filter((field) => declared?.[field]), ...(hasAltType && idFields.includes('altId') && declared?.[ALT_TYPE_FIELD] ? [ALT_TYPE_FIELD] : [])]
+    : [];
+  const cacheKey = `${endpoint.name}${relaxable.length ? `:default-location:${relaxable.join(',')}${aliasHint ? `:${aliasHint}` : ''}` : ''}`;
   let schema = schemaCache.get(cacheKey);
   if (!schema) {
     let jsonSchema = endpoint.inputSchema;
-    if (relaxLocation) {
+    if (relaxable.length) {
       const properties = { ...(declared as Record<string, Record<string, unknown>>) };
-      const locationSchema = properties.locationId ?? {};
-      properties.locationId = {
-        ...locationSchema,
-        // An explicit null is how a model says "I don't have one". Accepting it here is
-        // what lets splitArguments fall back to the default instead of failing or, as
-        // before, dropping the field and calling the API with no location at all.
-        ...(typeof locationSchema.type === 'string' ? { type: [locationSchema.type, 'null'] } : {}),
-        description: `${locationSchema.description ? `${locationSchema.description} ` : ''}(defaults to ${defaultLocationId} when omitted)`,
-      };
-      const required = ((jsonSchema.required as string[] | undefined) ?? []).filter((field) => field !== 'locationId');
+      for (const field of relaxable) {
+        const fieldSchema = properties[field] ?? {};
+        const note = field === ALT_TYPE_FIELD
+          ? `(defaults to "${LOCATION_ALT_TYPE}" when omitted)`
+          : `(defaults to ${defaultLocationId} when omitted${aliasHint ? `; ${aliasHint}` : ''})`;
+        properties[field] = {
+          ...fieldSchema,
+          // An explicit null is how a model says "I don't have one". Accepting it here is
+          // what lets splitArguments fall back to the default instead of failing or, as
+          // before, dropping the field and calling the API with no location at all.
+          ...(typeof fieldSchema.type === 'string' ? { type: [fieldSchema.type, 'null'] } : {}),
+          // altType carries enum:["location"]. Widening only `type` would still reject
+          // null, because the enum is the narrower constraint of the two.
+          ...(Array.isArray(fieldSchema.enum) ? { enum: [...fieldSchema.enum, null] } : {}),
+          description: `${fieldSchema.description ? `${fieldSchema.description} ` : ''}${note}`,
+        };
+      }
+      const required = ((jsonSchema.required as string[] | undefined) ?? []).filter((field) => !relaxable.includes(field));
       jsonSchema = { ...jsonSchema, properties, ...(required.length ? { required } : {}) };
       if (!required.length) delete jsonSchema.required;
     }
@@ -71,13 +126,24 @@ export interface SplitArguments {
  */
 export function splitArguments(endpoint: EndpointDef, args: ToolArgs, defaultLocationId?: string): SplitArguments {
   const values: ToolArgs = { ...args };
-  const takesLocationId = ['pathFields', 'queryFields', 'bodyFields'].some((key) =>
-    (endpoint[key as 'pathFields' | 'queryFields' | 'bodyFields']).includes('locationId'),
-  );
-  // An explicit null is "no value", not a value: without this it silently beat the
-  // configured default and the request left with no locationId at all.
-  if (takesLocationId && (values.locationId === undefined || values.locationId === null) && defaultLocationId) {
-    values.locationId = defaultLocationId;
+  const { idFields, hasAltType } = locationFieldsOf(endpoint);
+
+  if (defaultLocationId) {
+    for (const field of idFields) {
+      // altId is only a location id when altType says so. If the caller explicitly
+      // asked for a company-scoped call, filling in a location id would silently
+      // retarget the request at the wrong thing.
+      if (field === 'altId' && hasAltType && !isBlank(values[ALT_TYPE_FIELD]) && values[ALT_TYPE_FIELD] !== LOCATION_ALT_TYPE) {
+        continue;
+      }
+      // An explicit null is "no value", not a value: without this it silently beat the
+      // configured default and the request left with no location at all.
+      if (isBlank(values[field])) values[field] = defaultLocationId;
+    }
+    // Pairing altType with the altId we just filled; the spec's enum is ["location"].
+    if (idFields.includes('altId') && hasAltType && isBlank(values[ALT_TYPE_FIELD])) {
+      values[ALT_TYPE_FIELD] = LOCATION_ALT_TYPE;
+    }
   }
 
   const pathParams: Record<string, unknown> = {};
@@ -153,6 +219,45 @@ export function formatError(error: unknown, endpoint?: EndpointDef): CallToolRes
   return { content: [{ type: 'text', text: truncate(text, 'Error body cut short.').text }], isError: true };
 }
 
+export interface ResolvedTarget {
+  entry?: LocationEntry;
+  locationId?: string;
+  token?: string;
+  args: ToolArgs;
+}
+
+/**
+ * Works out which sub-account this call is for, swaps any friendly alias for the
+ * real id, and picks that sub-account's token. Throws rather than guessing when an
+ * unrecognised name is given and more than one sub-account is configured: sending a
+ * write to the wrong CRM is not a recoverable mistake.
+ */
+export function resolveTarget(endpoint: EndpointDef, args: ToolArgs, config: ServerConfig): ResolvedTarget {
+  const registry = registryOf(config);
+  const { idFields } = locationFieldsOf(endpoint);
+  const requestedField = idFields.find((field) => !isBlank(args[field]));
+  const requested = requestedField ? String(args[requestedField]) : undefined;
+
+  const entry = registry.resolve(requested);
+  if (requested !== undefined && !entry && registry.size > 1) {
+    throw new Error(
+      `Unknown location "${requested}". Configured sub-accounts: ${registry.aliases().join(', ')}. Use ghl_list_locations to see aliases and ids.`,
+    );
+  }
+
+  // An unrecognised id with 0-1 configured locations is passed through untouched:
+  // that is the single-token setup, where any id the token can see is legitimate.
+  const locationId = entry?.locationId ?? requested ?? registry.defaultEntry?.locationId ?? config.locationId;
+  const next: ToolArgs = { ...args };
+  if (entry && requestedField && String(args[requestedField]) !== entry.locationId) {
+    // The model passed an alias; every field that names this location gets the real id.
+    for (const field of idFields) {
+      if (!isBlank(next[field])) next[field] = entry.locationId;
+    }
+  }
+  return { entry, locationId, token: registry.tokenFor(entry) ?? config.apiKey, args: next };
+}
+
 export async function executeEndpoint(
   endpoint: EndpointDef,
   args: ToolArgs,
@@ -169,7 +274,9 @@ export async function executeEndpoint(
     if (!parsed.success) {
       return formatError(new Error(`Invalid arguments for ${endpoint.name}: ${z.prettifyError(parsed.error)}`), endpoint);
     }
-    const { pathParams, query, body } = splitArguments(endpoint, parsed.data as ToolArgs, config.locationId);
+    // Alias -> real id -> that sub-account's token, before anything is routed.
+    const target = resolveTarget(endpoint, parsed.data as ToolArgs, config);
+    const { pathParams, query, body } = splitArguments(endpoint, target.args, target.locationId);
     const data = await client.request({
       method: endpoint.method,
       path: endpoint.path,
@@ -178,6 +285,7 @@ export async function executeEndpoint(
       query,
       body,
       contentType: endpoint.contentType,
+      token: target.token,
     });
     return formatResult(data);
   } catch (error) {
@@ -191,6 +299,10 @@ export function registerEndpointTools(
   client: GhlClient,
   config: ServerConfig,
 ): number {
+  const registry = registryOf(config);
+  // With one sub-account there is nothing to choose, so the hint stays out of the
+  // tool list; with several it is worth the tokens on every location-bearing tool.
+  const aliasHint = registry.size > 1 ? `or pass one of: ${registry.aliases().join(', ')}` : undefined;
   let registered = 0;
   for (const endpoint of endpoints) {
     // Hidden rather than merely blocked, so disabled classes cost no context at all.
@@ -203,7 +315,7 @@ export function registerEndpointTools(
       {
         title: endpoint.summary,
         description: endpoint.description,
-        inputSchema: inputSchemaFor(endpoint, config.locationId),
+        inputSchema: inputSchemaFor(endpoint, config.locationId, aliasHint),
         annotations: {
           readOnlyHint: endpoint.operationClass === 'read',
           // Per the MCP spec destructiveHint:false promises additive updates only, so a

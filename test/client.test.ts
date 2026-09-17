@@ -1,6 +1,40 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { GhlApiError, GhlClient, retryDelayMs } from '../src/client.ts';
+import type { ServerConfig } from '../src/config.ts';
+import type { EndpointDef } from '../src/generator/openapi.ts';
+import { LocationRegistry, parseLocations } from '../src/locations.ts';
+import { resolveTarget } from '../src/tools.ts';
+
+const targetConfig: ServerConfig = {
+  apiKey: 'k',
+  baseUrl: 'https://api.test',
+  modules: ['contacts'],
+  allowWrites: false,
+  allowDeletes: false,
+  metaTools: true,
+  includeDeprecated: false,
+  locationId: 'LOC1',
+};
+
+const locEndpoint: EndpointDef = {
+  name: 'contacts_get',
+  module: 'contacts',
+  method: 'GET',
+  path: '/contacts/',
+  version: '2021-07-28',
+  summary: 'Get',
+  description: 'Get',
+  scopes: ['contacts.readonly'],
+  access: 'location',
+  operationClass: 'read',
+  deprecated: false,
+  pathFields: [],
+  queryFields: ['locationId'],
+  bodyFields: [],
+  bodyWrapped: false,
+  inputSchema: { type: 'object', properties: { locationId: { type: 'string' } } },
+};
 
 interface RecordedCall {
   url: string;
@@ -103,4 +137,57 @@ test('urlencoded arrays repeat the key, matching query-string encoding', async (
     body: { scope: ['a', 'b'], grant_type: 'code' },
   });
   assert.equal(String(calls[0].init.body), 'scope=a&scope=b&grant_type=code');
+});
+
+test('parseLocations accepts the object form and normalizes aliases', () => {
+  const entries = parseLocations('{"Solace Care":{"locationId":"L1","token":"pit-a"},"toams":{"locationId":"L2","token":"pit-b"}}');
+  assert.deepEqual(entries.map((entry) => entry.alias), ['solace-care', 'toams']);
+  assert.equal(entries[0].locationId, 'L1');
+});
+
+test('parseLocations accepts the array form and inherits the shared token', () => {
+  const entries = parseLocations('[{"alias":"a","locationId":"L1"},{"alias":"b","locationId":"L2"}]', 'pit-shared');
+  assert.equal(entries.length, 2);
+  assert.equal(entries[0].token, '', 'entry token stays empty; the registry supplies the fallback');
+});
+
+test('parseLocations rejects a location with no token and no shared fallback', () => {
+  assert.throws(() => parseLocations('[{"alias":"a","locationId":"L1"}]'), /No token for location/);
+});
+
+test('parseLocations rejects duplicate aliases and duplicate location ids', () => {
+  assert.throws(() => parseLocations('[{"alias":"a","locationId":"L1","token":"t"},{"alias":"a","locationId":"L2","token":"t"}]'), /Duplicate location alias/);
+  assert.throws(() => parseLocations('[{"alias":"a","locationId":"L1","token":"t"},{"alias":"b","locationId":"L1","token":"t"}]'), /Duplicate locationId/);
+});
+
+test('the registry resolves by alias or raw id and never exposes tokens', () => {
+  const registry = new LocationRegistry(parseLocations('{"solace":{"locationId":"L1","token":"pit-a"},"toams":{"locationId":"L2","token":"pit-b"}}'), 'toams');
+  assert.equal(registry.resolve('solace')?.locationId, 'L1');
+  assert.equal(registry.resolve('L1')?.alias, 'solace');
+  assert.equal(registry.resolve('Solace')?.alias, 'solace', 'alias lookup is case-insensitive');
+  assert.equal(registry.resolve(undefined)?.alias, 'toams', 'GHL_DEFAULT_LOCATION picks the default');
+  assert.equal(registry.resolve('nope'), undefined);
+  assert.equal(registry.tokenFor(registry.resolve('solace')), 'pit-a');
+  assert.equal(JSON.stringify(registry.describe()).includes('pit-'), false, 'no token may reach a tool result');
+});
+
+test('resolveTarget swaps an alias for the real id and picks that sub-account token', () => {
+  const registry = new LocationRegistry(parseLocations('{"solace":{"locationId":"L1","token":"pit-a"},"toams":{"locationId":"L2","token":"pit-b"}}'));
+  const config = { ...targetConfig, locations: registry, locationId: 'L1' };
+  const target = resolveTarget(locEndpoint, { locationId: 'toams' }, config);
+  assert.equal(target.args.locationId, 'L2', 'the alias is replaced before the request is built');
+  assert.equal(target.token, 'pit-b', 'the call uses the token minted in that sub-account');
+});
+
+test('resolveTarget refuses an unknown location when several are configured', () => {
+  const registry = new LocationRegistry(parseLocations('{"solace":{"locationId":"L1","token":"pit-a"},"toams":{"locationId":"L2","token":"pit-b"}}'));
+  const config = { ...targetConfig, locations: registry, locationId: 'L1' };
+  // Guessing here would mean sending a write to whichever CRM happened to be first.
+  assert.throws(() => resolveTarget(locEndpoint, { locationId: 'acme' }, config), /Unknown location "acme"/);
+});
+
+test('resolveTarget passes an unrecognised id through in single-token mode', () => {
+  const target = resolveTarget(locEndpoint, { locationId: 'ANY' }, targetConfig);
+  assert.equal(target.args.locationId, 'ANY');
+  assert.equal(target.token, 'k');
 });

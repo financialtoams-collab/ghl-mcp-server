@@ -8,6 +8,11 @@ export interface GhlRequest {
   query?: Record<string, unknown>;
   body?: unknown;
   contentType?: BodyContentType;
+  /**
+   * Private Integration Token for this call. Set per request because each GHL
+   * sub-account mints its own; falls back to the client-wide key when absent.
+   */
+  token?: string;
 }
 
 export class GhlApiError extends Error {
@@ -25,7 +30,8 @@ export class GhlApiError extends Error {
 }
 
 export interface GhlClientOptions {
-  apiKey: string;
+  /** Default token. Optional when every call carries its own via GhlRequest.token. */
+  apiKey?: string;
   baseUrl: string;
   fetchImpl?: typeof fetch;
 }
@@ -149,8 +155,12 @@ export class GhlClient {
 
   async request(req: GhlRequest, attempt = 0): Promise<unknown> {
     const url = this.buildUrl(req.path, req.pathParams, req.query);
+    const token = req.token || this.options.apiKey;
+    if (!token) {
+      throw new GhlApiError(401, 'No API token available for this request. Set GHL_API_KEY, or give this location a token in GHL_LOCATIONS.');
+    }
     const headers: Record<string, string> = {
-      Authorization: `Bearer ${this.options.apiKey}`,
+      Authorization: `Bearer ${token}`,
       Version: req.version,
       Accept: 'application/json',
     };

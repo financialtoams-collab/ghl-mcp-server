@@ -1,3 +1,5 @@
+import { buildRegistry, LocationRegistry } from './locations.ts';
+
 export interface ServerConfig {
   apiKey: string;
   locationId?: string;
@@ -7,6 +9,8 @@ export interface ServerConfig {
   allowDeletes: boolean;
   metaTools: boolean;
   includeDeprecated: boolean;
+  /** Alias -> location -> token map. Absent means single-location mode via locationId. */
+  locations?: LocationRegistry;
 }
 
 export const DEFAULT_BASE_URL = 'https://services.leadconnectorhq.com';
@@ -55,14 +59,19 @@ export function parseBaseUrl(value: string | undefined): string {
 
 export function loadConfig(env: Env = process.env): ServerConfig {
   const apiKey = env.GHL_API_KEY?.trim();
-  if (!apiKey) {
+  const locationsJson = env.GHL_LOCATIONS?.trim();
+  // With GHL_LOCATIONS every entry can carry its own token, so GHL_API_KEY becomes
+  // optional there — it stays as the shared fallback and the agency-level token.
+  if (!apiKey && !locationsJson) {
     throw new Error(
-      'GHL_API_KEY is not set. Create a Private Integration token in GHL (Settings -> Private Integrations) and export it, or copy .env.example to .env.',
+      'GHL_API_KEY is not set. Create a Private Integration token in GHL (Settings -> Private Integrations) and export it, or copy .env.example to .env. For several sub-accounts, set GHL_LOCATIONS instead.',
     );
   }
+  const locations = buildRegistry(locationsJson, env.GHL_LOCATION_ID?.trim(), apiKey, env.GHL_DEFAULT_LOCATION?.trim());
   return {
-    apiKey,
-    locationId: env.GHL_LOCATION_ID?.trim() || undefined,
+    apiKey: apiKey ?? '',
+    locationId: locations.defaultEntry?.locationId ?? (env.GHL_LOCATION_ID?.trim() || undefined),
+    locations,
     baseUrl: parseBaseUrl(env.GHL_BASE_URL),
     modules: parseModules(env.GHL_MODULES),
     allowWrites: parseBoolean(env.GHL_ALLOW_WRITES, false),

@@ -1,0 +1,54 @@
+# Render blueprint. In Render: New -> Blueprint -> point at this repo.
+# Everything marked `sync: false` is filled in the dashboard, never committed.
+services:
+  - type: web
+    name: ghl-mcp-server
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    # Free instances sleep after inactivity, which shows up as a slow first tool
+    # call. Starter keeps it warm; move up only if you hit real load.
+    plan: starter
+    region: oregon
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      # Bearer token the MCP client must send. Render generates it; read it from
+      # the dashboard once and paste it into the Claude connector setup.
+      - key: MCP_AUTH_TOKEN
+        generateValue: true
+
+      # JSON map of sub-account alias -> locationId + Private Integration Token.
+      # Set in the dashboard: it holds every CRM credential.
+      #   {"solace":{"locationId":"...","token":"pit-..."}, "toams":{...}}
+      - key: GHL_LOCATIONS
+        sync: false
+
+      # Which alias is used when a tool call names no location.
+      - key: GHL_DEFAULT_LOCATION
+        sync: false
+
+      # Optional shared/agency token. Used for agency-level endpoints and as the
+      # fallback for any GHL_LOCATIONS entry that omits its own token.
+      - key: GHL_API_KEY
+        sync: false
+
+      # Dedicated tools loaded into the tool list. Keep this small: the meta-tools
+      # reach all 576 endpoints on demand, so more modules here buys nothing but
+      # context. See the README table for measured costs.
+      - key: GHL_MODULES
+        value: contacts,conversations,opportunities
+
+      - key: GHL_ALLOW_WRITES
+        value: "true"
+      # Deletes stay off. Turn this on only deliberately, and never together with
+      # a client that auto-approves tool calls.
+      - key: GHL_ALLOW_DELETES
+        value: "false"
+      - key: GHL_META_TOOLS
+        value: "true"
+
+      # Render terminates TLS and forwards its own hostname; the server picks that
+      # up from RENDER_EXTERNAL_HOSTNAME, so MCP_ALLOWED_HOSTS is only needed if
+      # you put a custom domain in front.
+      - key: MCP_BIND_HOST
+        value: 0.0.0.0

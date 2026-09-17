@@ -1,0 +1,77 @@
+name: Spec drift
+
+# HighLevel changes its public API without telling anyone here. This re-fetches
+# their specs weekly, regenerates, and opens a PR when the surface has moved, so
+# the catalog is refreshed on purpose rather than whenever someone remembers.
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+          cache: npm
+
+      - run: npm ci --ignore-scripts
+
+      - name: Fetch upstream specs
+        env:
+          # Lifts GitHub's 60 req/hr unauthenticated limit on the spec download.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm run specs:fetch
+
+      # The generator exits non-zero on a schema Zod cannot express, a tool-name
+      # collision, or an unfillable {placeholder}. That failure is the signal
+      # worth having: it means the upstream change needs a human.
+      - name: Regenerate the catalog
+        run: npm run generate
+
+      - name: Test against the refreshed catalog
+        run: npm run build && node --test "dist/test/*.test.js"
+
+      - name: Summarise the change
+        id: drift
+        run: |
+          if git diff --quiet -- specs generated; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No upstream change." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "### HighLevel API drift"
+              echo
+              echo '```'
+              git diff --stat -- specs generated
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Open a pull request
+        if: steps.drift.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH="spec-drift/$(date +%Y-%m-%d)"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Reuse the branch if this week's run already opened one.
+          git checkout -B "$BRANCH"
+          git add specs generated
+          git commit -m "chore: refresh HighLevel specs and regenerate catalog"
+          git push --force-with-lease origin "$BRANCH"
+          if [ -z "$(gh pr list --head "$BRANCH" --state open --json number --jq '.[].number')" ]; then
+            gh pr create --head "$BRANCH" --base main \
+              --title "Refresh HighLevel specs ($(date +%Y-%m-%d))" \
+              --body "Automated weekly re-fetch of HighLevel's OpenAPI specs plus regeneration. Tests pass against the refreshed catalog. Review the diff for endpoints added, removed, or changed shape before merging."
+          fi
