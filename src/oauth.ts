@@ -20,6 +20,8 @@ import { normalizeAlias } from './locations.ts';
 const OAUTH_VERSION = '2021-07-28';
 /** Refresh this long before expiry so an in-flight request never races the clock. */
 const EXPIRY_MARGIN_MS = 60_000;
+/** Statuses that suggest the body encoding was refused rather than the credentials. */
+const UNSUPPORTED_ENCODING = new Set([400, 415, 422]);
 
 export interface StoredTokens {
   refreshToken: string;
@@ -200,11 +202,22 @@ export class AgencyAuth {
   }
 
   private async exchange(fields: Record<string, string | undefined>): Promise<TokenResponse> {
-    const response = await this.fetchImpl(`${this.options.baseUrl}/oauth/token`, {
+    // HighLevel's spec declares application/x-www-form-urlencoded, but their own
+    // docs show the authorization_code exchange as JSON. The two disagree, and
+    // this runs exactly once during an install, so try the documented spec
+    // encoding and fall back rather than fail the one shot that matters.
+    let response = await this.fetchImpl(`${this.options.baseUrl}/oauth/token`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
       body: formBody(fields),
     });
+    if (UNSUPPORTED_ENCODING.has(response.status)) {
+      response = await this.fetchImpl(`${this.options.baseUrl}/oauth/token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify(Object.fromEntries(formBody(fields))),
+      });
+    }
     const text = await response.text();
     let data: TokenResponse;
     try {
@@ -270,16 +283,26 @@ export class LocationTokenCache {
     if (!companyId) {
       throw new GhlApiError(400, 'No companyId known for the agency. Set GHL_COMPANY_ID, or re-authorise so the token exchange reports it.');
     }
-    const response = await this.fetchImpl(`${this.baseUrl}/oauth/locationToken`, {
+    const headers = {
+      Authorization: `Bearer ${agencyToken}`,
+      Version: OAUTH_VERSION,
+      Accept: 'application/json',
+    };
+    // HighLevel's spec declares form-urlencoded here; their published docs show
+    // the same call as JSON. Rather than bet on one, try the spec's encoding and
+    // fall back to the docs' when the body itself looks like what was refused.
+    let response = await this.fetchImpl(`${this.baseUrl}/oauth/locationToken`, {
       method: 'POST',
-      headers: {
-        Authorization: `Bearer ${agencyToken}`,
-        'Content-Type': 'application/x-www-form-urlencoded',
-        Version: OAUTH_VERSION,
-        Accept: 'application/json',
-      },
+      headers: { ...headers, 'Content-Type': 'application/x-www-form-urlencoded' },
       body: formBody({ companyId, locationId }),
     });
+    if (UNSUPPORTED_ENCODING.has(response.status)) {
+      response = await this.fetchImpl(`${this.baseUrl}/oauth/locationToken`, {
+        method: 'POST',
+        headers: { ...headers, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ companyId, locationId }),
+      });
+    }
     const text = await response.text();
     let data: TokenResponse;
     try {

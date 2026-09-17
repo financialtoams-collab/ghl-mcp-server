@@ -255,3 +255,45 @@ test('an ambiguous name resolves to nothing rather than the wrong CRM', async ()
   assert.equal(await directory.resolve('relax'), undefined);
   assert.equal((await directory.resolve('Relax Estate'))?.locationId, 'L1', 'the exact name still resolves');
 });
+
+test('the token exchange falls back to JSON when form encoding is refused', async () => {
+  // HighLevel's spec says form-urlencoded; their docs show JSON. This runs once,
+  // during an install, so a wrong guess would strand the whole setup.
+  const seen: string[] = [];
+  const fetchImpl = (async (_url: string | URL, init?: RequestInit) => {
+    const contentType = (init?.headers as Record<string, string>)['Content-Type'];
+    seen.push(contentType);
+    if (contentType === 'application/x-www-form-urlencoded') {
+      return new Response(JSON.stringify({ message: 'Unsupported Media Type' }), { status: 415 });
+    }
+    return new Response(JSON.stringify({ access_token: 'via-json', refresh_token: 'r', expires_in: 3600, companyId: 'CO1' }));
+  }) as unknown as typeof fetch;
+
+  const auth = new AgencyAuth({
+    clientId: 'c', clientSecret: 's', baseUrl: BASE, store: new MemoryTokenStore(), seedRefreshToken: 'seed', fetchImpl,
+  });
+  assert.equal(await auth.token(), 'via-json');
+  assert.deepEqual(seen, ['application/x-www-form-urlencoded', 'application/json'], 'spec encoding first, docs encoding second');
+});
+
+test('the location token mint falls back to JSON too', async () => {
+  const seen: string[] = [];
+  const fetchImpl = (async (url: string | URL, init?: RequestInit) => {
+    const contentType = (init?.headers as Record<string, string>)['Content-Type'];
+    if (String(url).endsWith('/oauth/token')) {
+      return new Response(JSON.stringify({ access_token: 'agency', refresh_token: 'r', expires_in: 3600, companyId: 'CO1' }));
+    }
+    seen.push(contentType);
+    if (contentType === 'application/x-www-form-urlencoded') {
+      return new Response(JSON.stringify({ message: 'Bad Request' }), { status: 400 });
+    }
+    return new Response(JSON.stringify({ access_token: 'loc-via-json', expires_in: 3600 }));
+  }) as unknown as typeof fetch;
+
+  const auth = new AgencyAuth({
+    clientId: 'c', clientSecret: 's', baseUrl: BASE, store: new MemoryTokenStore(), seedRefreshToken: 'seed', fetchImpl,
+  });
+  const cache = new LocationTokenCache(auth, { baseUrl: BASE, fetchImpl });
+  assert.equal(await cache.tokenFor('LOC1'), 'loc-via-json');
+  assert.deepEqual(seen, ['application/x-www-form-urlencoded', 'application/json']);
+});

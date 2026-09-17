@@ -158,6 +158,46 @@ connection is dead until someone re-installs the app by hand. Two consequences:
 
 A rejected refresh token reports exactly this cause rather than a bare `invalid_grant`.
 
+### Creating the marketplace app
+
+Steps below are from HighLevel's current OAuth 2.0 documentation, read in September 2026.
+
+1. **marketplace.gohighlevel.com** → sign up for a developer account → **My Apps** →
+   **Create App**.
+2. On the create form:
+   - **App Type: Private.** Not listed in the marketplace; right for an internal
+     integration, and HighLevel recommends starting here regardless.
+   - **Target User: Agency.** Their docs say ~95% of apps want *Sub-account*, but that
+     yields a Location token. This server needs a **Company** token to mint location
+     tokens, so Agency is the setting that makes the whole design work.
+   - **Who can install: Agency**, and **Listing Type: White-label**.
+3. Fill in the profile details (logo, category, description) — the app will not save
+   without them.
+4. **Advanced Settings → Auth**:
+   - **Scopes** — least privilege. For the modules this server exposes by default:
+     `contacts.readonly` `contacts.write` `conversations.readonly` `conversations.write`
+     `conversations/message.write` `opportunities.readonly` `opportunities.write`
+     `locations.readonly` `oauth.readonly` `oauth.write`. Add `invoices.*`,
+     `payments/transactions.readonly`, `products.readonly`, `workflows.readonly` as needed.
+     `oauth.readonly` and `oauth.write` are **not optional** — they are what permit
+     `installedLocations` and `locationToken`.
+   - **Redirect URL** → `https://<your-service>.onrender.com/oauth/callback` → **Add**.
+     It must match `GHL_REDIRECT_URI` exactly.
+   - **Client Keys → Add** → name the pair. **Copy the Client Secret immediately**:
+     HighLevel shows it once and it cannot be retrieved from the UI afterwards.
+5. Still under **Advanced Settings → Auth**, the **Install Link** is at the top of the
+   page behind a **Show** button. Open it, pick the agency, approve.
+
+That redirect lands on `/oauth/callback`, which exchanges the code and writes the refresh
+token to `GHL_TOKEN_STORE`. The page says so plainly when it works.
+
+**Finding `GHL_APP_ID`:** HighLevel's own samples show a client id of
+`665c6bb13d4e5364bdec0e2f-mawqjyjd` alongside an app id of `665c6bb13d4e5364bdec0e2f` —
+the client id appears to be the app id plus a suffix. That is an inference from their
+examples, not something their docs state, so confirm it against the `appId` in the app's
+install webhook payload before relying on it. Only `ghl_list_locations` needs it; tool
+calls that name a location id work without it.
+
 ### Tokens in flight
 
 The agency access token is cached until a minute before expiry, and concurrent callers
