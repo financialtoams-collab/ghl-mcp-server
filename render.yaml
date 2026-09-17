@@ -5,9 +5,16 @@ services:
     name: ghl-mcp-server
     runtime: docker
     dockerfilePath: ./Dockerfile
-    # Free instances sleep after inactivity, which shows up as a slow first tool
-    # call. Starter keeps it warm; move up only if you hit real load.
-    plan: starter
+    # Verified against Render's current docs: `plan` takes an instance type such
+    # as `free` or `1c-2g`. "starter" is now a LEGACY instance type name.
+    # 0.5c-512mb is the cheapest current paid tier ($7/mo at time of writing).
+    #
+    # `free` is not an option here, for a specific reason rather than performance:
+    # "data persistence is not available for free instances", so a free instance
+    # cannot carry the disk below — and without the disk the rotated agency
+    # refresh token dies on every restart, which on free instances (they sleep
+    # when idle) would be constantly.
+    plan: 0.5c-512mb
     region: oregon
     healthCheckPath: /health
     autoDeploy: true
@@ -15,8 +22,10 @@ services:
     # HighLevel rotates the agency refresh token on every exchange, so it must
     # outlive the container. Without this disk the filesystem is ephemeral and
     # every deploy or restart would silently require re-authorising the agency.
-    # A disk also pins the service to one instance, which is what we want here:
-    # two instances would race each other's rotations and both lose.
+    # A disk also pins the service to one instance — Render's docs put it as
+    # "you can't scale a service with an attached persistent disk" — which is
+    # exactly what we want: two instances would race each other's refresh-token
+    # rotations and both end up holding invalid ones.
     disk:
       name: ghl-tokens
       mountPath: /var/data
